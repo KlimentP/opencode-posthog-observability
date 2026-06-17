@@ -9,6 +9,8 @@ export type { PartialPluginConfig, PluginConfig } from "./config.js";
 
 type MessageLike = {
   id?: string;
+  parentID?: string;
+  parentId?: string;
   sessionID?: string;
   sessionId?: string;
   role?: string;
@@ -45,6 +47,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
   const pendingMessages = new Map<string, Record<string, unknown>>();
   const messageSessions = new Map<string, string>();
   const messageRoles = new Map<string, string>();
+  const messageInputs = new Map<string, string>();
   const partTypes = new Map<string, string>();
   let posthog: PostHog | undefined;
 
@@ -90,6 +93,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
           pendingMessages,
           messageSessions,
           messageRoles,
+          messageInputs,
           partTypes,
           log,
         });
@@ -109,6 +113,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
         pendingMessages,
         messageSessions,
         messageRoles,
+        messageInputs,
         partTypes,
         log,
       });
@@ -131,6 +136,7 @@ async function handleEvent(
     pendingMessages: Map<string, Record<string, unknown>>;
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
+    messageInputs: Map<string, string>;
     partTypes: Map<string, string>;
     log: (message: string) => void;
   },
@@ -213,6 +219,7 @@ async function handleEvent(
       context.pendingMessages.delete(messageId);
       context.messageSessions.delete(messageId);
       context.messageRoles.delete(messageId);
+      context.messageInputs.delete(messageId);
       removeMessagePartTypes(context.partTypes, messageId);
     }
     return;
@@ -239,6 +246,7 @@ function rememberMessage(
     pendingMessages: Map<string, Record<string, unknown>>;
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
+    messageInputs: Map<string, string>;
   },
 ): void {
   const message = getMessage(properties);
@@ -257,6 +265,8 @@ function rememberMessage(
 
   if (message.role && message.role !== "assistant") return;
   if (!isMessageComplete(message)) return;
+  const input = inputForAssistant(message, context);
+  if (input) context.messageInputs.set(message.id, input);
   context.pendingMessages.set(message.id, properties);
 }
 
@@ -271,6 +281,7 @@ function capturePendingMessages(
     pendingMessages: Map<string, Record<string, unknown>>;
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
+    messageInputs: Map<string, string>;
     partTypes: Map<string, string>;
     log: (message: string) => void;
   },
@@ -293,6 +304,7 @@ function captureMessage(
     reasoningCache: MessageTextCache;
     capturedMessages: Set<string>;
     pendingMessages: Map<string, Record<string, unknown>>;
+    messageInputs: Map<string, string>;
     log: (message: string) => void;
   },
 ): void {
@@ -313,6 +325,7 @@ function captureMessage(
     ...context.sessions.get(sessionId),
     model: context.sessions.get(sessionId)?.model ?? message.modelID,
     provider: context.sessions.get(sessionId)?.provider ?? message.providerID,
+    input: context.messageInputs.get(message.id) ?? inputForAssistant(message, context) ?? context.sessions.get(sessionId)?.input,
     spanName: spanName(message),
   };
   const eventProperties = buildGenerationProperties({
@@ -333,6 +346,7 @@ function captureMessage(
   });
   rememberCapturedMessage(context.capturedMessages, message.id);
   context.pendingMessages.delete(message.id);
+  context.messageInputs.delete(message.id);
   context.log(
     `captured message ${message.id} input=${textLength(session.input)} output=${output?.length ?? 0} reasoning=${reasoning?.length ?? 0}`,
   );
@@ -341,6 +355,17 @@ function captureMessage(
 function spanName(message: MessageLike): string {
   const label = message.mode ?? message.agent;
   return label ? `opencode generation (${label})` : "opencode generation";
+}
+
+function inputForAssistant(
+  message: MessageLike,
+  context: {
+    textCache: MessageTextCache;
+  },
+): string | undefined {
+  const parentId = message.parentID ?? message.parentId;
+  if (!parentId) return undefined;
+  return context.textCache.get(parentId);
 }
 
 function getMessage(properties: Record<string, unknown>): MessageLike | undefined {

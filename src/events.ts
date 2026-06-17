@@ -29,7 +29,7 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
   const latency = typeof startedAt === "number" && finishedAt >= startedAt ? (finishedAt - startedAt) / 1000 : undefined;
 
   const properties: Record<string, unknown> = {
-    $ai_trace_id: input.sessionId,
+    $ai_trace_id: input.messageId,
     $ai_session_id: input.sessionId,
     $ai_span_id: input.messageId,
     $ai_span_name: input.session?.spanName ?? "opencode generation",

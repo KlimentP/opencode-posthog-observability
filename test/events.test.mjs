@@ -37,7 +37,8 @@ test("builds posthog ai generation properties", () => {
     config,
   );
 
-  assert.equal(properties.$ai_trace_id, "session-1");
+  assert.equal(properties.$ai_trace_id, "message-1");
+  assert.equal(properties.$ai_session_id, "session-1");
   assert.equal(properties.$ai_model, "claude-sonnet-4");
   assert.equal(properties.$ai_span_name, "opencode generation (build)");
   assert.equal(properties.$ai_latency, 1.5);
