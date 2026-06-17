@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "./node_modules/opencode-posthog-observability/dist/index.js"
+  ]
+}

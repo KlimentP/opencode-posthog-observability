@@ -1,0 +1,52 @@
+{
+  "name": "opencode-posthog-observability",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that sends AI observability telemetry to PostHog.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "posthog",
+    "ai-observability",
+    "telemetry"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "posthog-node": "^5.38.0",
+    "strip-json-comments": "^5.0.3"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.7",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.13"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  }
+}
