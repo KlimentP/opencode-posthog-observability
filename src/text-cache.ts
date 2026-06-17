@@ -26,6 +26,15 @@ export class MessageTextCache {
     this.#evictOldest();
   }
 
+  append(messageId: string, partId: string, delta: string): void {
+    const existing = this.getPart(messageId, partId) ?? "";
+    this.update(messageId, partId, `${existing}${delta}`);
+  }
+
+  getPart(messageId: string, partId: string): string | undefined {
+    return this.#messages.get(messageId)?.get(partId);
+  }
+
   removePart(messageId: string, partId: string): void {
     const parts = this.#messages.get(messageId);
     if (!parts) return;

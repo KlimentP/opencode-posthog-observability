@@ -6,12 +6,14 @@ export type SessionMetadata = {
   provider?: string;
   input?: unknown;
   startedAt?: number;
+  spanName?: string;
 };
 
 export type GenerationInput = {
   sessionId: string;
   messageId: string;
   output?: string;
+  reasoning?: string;
   usage?: {
     input?: number;
     output?: number;
@@ -30,7 +32,7 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
     $ai_trace_id: input.sessionId,
     $ai_session_id: input.sessionId,
     $ai_span_id: input.messageId,
-    $ai_span_name: "opencode generation",
+    $ai_span_name: input.session?.spanName ?? "opencode generation",
     $ai_model: input.session?.model,
     $ai_provider: input.session?.provider,
     $ai_input_tokens: input.usage?.input,
@@ -44,11 +46,17 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
   };
 
   if (config.captureInputs && input.session?.input !== undefined) {
-    properties.$ai_input = redact(input.session.input);
+    properties.$ai_input = normalizeInputMessages(input.session.input);
   }
 
-  if (config.captureOutputs && input.output) {
-    properties.$ai_output_choices = [{ content: input.output, role: "assistant" }];
+  if (config.captureOutputs) {
+    const outputChoices = [
+      ...(input.reasoning ? [{ content: input.reasoning, role: "reasoning" }] : []),
+      ...(input.output ? [{ content: input.output, role: "assistant" }] : []),
+    ];
+    if (outputChoices.length > 0) {
+      properties.$ai_output_choices = outputChoices;
+    }
   }
 
   if (config.captureMetadata && input.metadata) {
@@ -56,6 +64,31 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
   }
 
   return dropUndefined(properties);
+}
+
+function normalizeInputMessages(input: unknown): Array<{ role: string; content: unknown }> {
+  const redacted = redact(input);
+  if (typeof redacted === "string") {
+    return [{ role: "user", content: redacted }];
+  }
+
+  if (Array.isArray(redacted)) {
+    return redacted.map((item) => normalizeInputMessage(item));
+  }
+
+  return [normalizeInputMessage(redacted)];
+}
+
+function normalizeInputMessage(input: unknown): { role: string; content: unknown } {
+  if (typeof input === "object" && input !== null) {
+    const record = input as Record<string, unknown>;
+    return {
+      role: typeof record.role === "string" ? record.role : "user",
+      content: record.content ?? record.text ?? record.body ?? input,
+    };
+  }
+
+  return { role: "user", content: input };
 }
 
 function prefixTags(tags: Record<string, string>): Record<string, string> {
