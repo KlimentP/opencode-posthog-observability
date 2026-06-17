@@ -2,6 +2,8 @@
 
 OpenCode plugin that sends AI generation telemetry to [PostHog AI Observability](https://posthog.com/docs/ai-observability).
 
+Each completed OpenCode assistant message is captured as one PostHog `$ai_generation` event. The plugin keeps each generation as its own trace while grouping related turns with the OpenCode session ID.
+
 ## Install
 
 ```sh
@@ -79,6 +81,8 @@ Environment variables override file config:
 
 By default, the plugin captures prompt input, assistant output, model/provider metadata, token counts, latency, OpenCode session/message IDs, and configured tags.
 
+When OpenCode exposes reasoning separately from the final answer, reasoning is sent as its own output entry before the assistant response. This keeps PostHog's conversation view readable without discarding reasoning content.
+
 Disable sensitive content capture when needed:
 
 ```sh
@@ -93,4 +97,20 @@ The plugin redacts common secret-looking object keys before sending metadata or 
 ```sh
 npm install
 npm test
+```
+
+For local OpenCode tests before publishing:
+
+```sh
+npm pack
+npm install ./opencode-posthog-observability-0.1.0.tgz --prefix .opencode
+```
+
+Then point local `.opencode/opencode.json` at the installed artifact:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./node_modules/opencode-posthog-observability/dist/index.js"]
+}
 ```
