@@ -23,6 +23,20 @@ export type GenerationInput = {
   finishedAt?: number;
 };
 
+export type ToolSpanInput = {
+  sessionId: string;
+  messageId: string;
+  spanId: string;
+  toolName: string;
+  status: string;
+  input?: unknown;
+  output?: unknown;
+  error?: unknown;
+  metadata?: Record<string, unknown>;
+  startedAt?: number;
+  finishedAt?: number;
+};
+
 export function buildGenerationProperties(input: GenerationInput, config: PluginConfig): Record<string, unknown> {
   const startedAt = input.session?.startedAt;
   const finishedAt = input.finishedAt ?? Date.now();
@@ -57,6 +71,45 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
     if (outputChoices.length > 0) {
       properties.$ai_output_choices = outputChoices;
     }
+  }
+
+  if (config.captureMetadata && input.metadata) {
+    properties.opencode_metadata = redact(input.metadata);
+  }
+
+  return dropUndefined(properties);
+}
+
+export function buildToolSpanProperties(input: ToolSpanInput, config: PluginConfig): Record<string, unknown> {
+  const latency = typeof input.startedAt === "number" && typeof input.finishedAt === "number" && input.finishedAt >= input.startedAt
+    ? (input.finishedAt - input.startedAt) / 1000
+    : undefined;
+
+  const properties: Record<string, unknown> = {
+    $ai_trace_id: input.messageId,
+    $ai_session_id: input.sessionId,
+    $ai_span_id: input.spanId,
+    $ai_span_name: `tool: ${input.toolName}`,
+    $ai_parent_id: input.messageId,
+    $ai_latency: latency,
+    $ai_is_error: input.status === "error",
+    $ai_error: input.error ? redact(input.error) : undefined,
+    opencode_session_id: input.sessionId,
+    opencode_message_id: input.messageId,
+    opencode_tool_call_id: input.spanId,
+    opencode_tool_name: input.toolName,
+    opencode_tool_status: input.status,
+    opencode_agent_name: config.agentName,
+    opencode_project_name: config.projectName,
+    ...prefixTags(config.tags),
+  };
+
+  if (config.captureInputs && input.input !== undefined) {
+    properties.$ai_input_state = redact(input.input);
+  }
+
+  if (config.captureOutputs && input.output !== undefined) {
+    properties.$ai_output_state = redact(input.output);
   }
 
   if (config.captureMetadata && input.metadata) {

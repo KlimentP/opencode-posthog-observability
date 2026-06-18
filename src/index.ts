@@ -1,7 +1,7 @@
 import { PostHog } from "posthog-node";
 import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { buildGenerationProperties, type SessionMetadata } from "./events.js";
+import { buildGenerationProperties, buildToolSpanProperties, type SessionMetadata } from "./events.js";
 import { loadConfig, mergePartialConfig, type PartialPluginConfig, type PluginConfig } from "./config.js";
 import { MessageTextCache } from "./text-cache.js";
 
@@ -27,12 +27,29 @@ type PartLike = {
   id?: string;
   messageID?: string;
   messageId?: string;
+  sessionID?: string;
+  sessionId?: string;
   text?: string;
   type?: string;
+  callID?: string;
+  callId?: string;
+  tool?: string;
+  state?: ToolStateLike;
+  metadata?: Record<string, unknown>;
 };
 
 type SessionLike = {
   id?: string;
+};
+
+type ToolStateLike = {
+  status?: string;
+  input?: unknown;
+  output?: unknown;
+  error?: unknown;
+  title?: string;
+  metadata?: Record<string, unknown>;
+  time?: { start?: number; end?: number };
 };
 
 export const PostHogObservabilityPlugin: Plugin = async (
@@ -49,6 +66,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
   const messageRoles = new Map<string, string>();
   const messageInputs = new Map<string, string>();
   const partTypes = new Map<string, string>();
+  const capturedToolCalls = new Set<string>();
   let posthog: PostHog | undefined;
 
   const log = logger(input, config);
@@ -95,6 +113,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
           messageRoles,
           messageInputs,
           partTypes,
+          capturedToolCalls,
           log,
         });
       } catch (error) {
@@ -115,6 +134,7 @@ export const PostHogObservabilityPlugin: Plugin = async (
         messageRoles,
         messageInputs,
         partTypes,
+        capturedToolCalls,
         log,
       });
       await posthog?._shutdown(config.flushTimeoutMs);
@@ -138,6 +158,7 @@ async function handleEvent(
     messageRoles: Map<string, string>;
     messageInputs: Map<string, string>;
     partTypes: Map<string, string>;
+    capturedToolCalls: Set<string>;
     log: (message: string) => void;
   },
 ): Promise<void> {
@@ -156,6 +177,9 @@ async function handleEvent(
       }
       if (part.type === "reasoning" && typeof part.text === "string") {
         context.reasoningCache.update(messageId, part.id, part.text);
+      }
+      if (part.type === "tool") {
+        captureToolPart(part, properties, context);
       }
     }
     return;
@@ -221,6 +245,7 @@ async function handleEvent(
       context.messageRoles.delete(messageId);
       context.messageInputs.delete(messageId);
       removeMessagePartTypes(context.partTypes, messageId);
+      removeCapturedToolCalls(context.capturedToolCalls, messageId);
     }
     return;
   }
@@ -283,6 +308,7 @@ function capturePendingMessages(
     messageRoles: Map<string, string>;
     messageInputs: Map<string, string>;
     partTypes: Map<string, string>;
+    capturedToolCalls: Set<string>;
     log: (message: string) => void;
   },
   sessionId?: string,
@@ -292,6 +318,54 @@ function capturePendingMessages(
     if (sessionId && messageSessionId !== sessionId) continue;
     captureMessage(properties, context);
   }
+}
+
+function captureToolPart(
+  part: PartLike,
+  properties: Record<string, unknown>,
+  context: {
+    config: PluginConfig;
+    posthog: PostHog;
+    capturedToolCalls: Set<string>;
+    log: (message: string) => void;
+  },
+): void {
+  const state = part.state;
+  if (!part.id || !state?.status) return;
+  if (state.status !== "completed" && state.status !== "error") return;
+
+  const sessionId = part.sessionID ?? part.sessionId ?? getString(properties, "sessionID", "sessionId");
+  const messageId = part.messageID ?? part.messageId ?? getString(properties, "messageID", "messageId");
+  const toolName = part.tool;
+  if (!sessionId || !messageId || !toolName) return;
+
+  const spanId = part.callID ?? part.callId ?? part.id;
+  const captureKey = `${messageId}:${spanId}`;
+  if (context.capturedToolCalls.has(captureKey)) return;
+
+  context.posthog.capture({
+    distinctId: context.config.distinctId,
+    event: "$ai_span",
+    properties: buildToolSpanProperties({
+      sessionId,
+      messageId,
+      spanId,
+      toolName,
+      status: state.status,
+      input: state.input,
+      output: state.output,
+      error: state.error,
+      metadata: {
+        ...(part.metadata ? { part: part.metadata } : {}),
+        ...(state.metadata ? { state: state.metadata } : {}),
+        ...(state.title ? { title: state.title } : {}),
+      },
+      startedAt: state.time?.start,
+      finishedAt: state.time?.end,
+    }, context.config),
+  });
+  rememberCapturedMessage(context.capturedToolCalls, captureKey);
+  context.log(`captured tool ${toolName} ${spanId} status=${state.status}`);
 }
 
 function captureMessage(
@@ -523,6 +597,13 @@ function removeMessagePartTypes(partTypes: Map<string, string>, messageId: strin
   const prefix = `${messageId}:`;
   for (const key of partTypes.keys()) {
     if (key.startsWith(prefix)) partTypes.delete(key);
+  }
+}
+
+function removeCapturedToolCalls(capturedToolCalls: Set<string>, messageId: string): void {
+  const prefix = `${messageId}:`;
+  for (const key of capturedToolCalls.keys()) {
+    if (key.startsWith(prefix)) capturedToolCalls.delete(key);
   }
 }
 

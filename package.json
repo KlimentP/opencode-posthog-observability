@@ -1,6 +1,6 @@
 {
   "name": "opencode-posthog-observability",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin that sends AI observability telemetry to PostHog.",
   "type": "module",
   "main": "./dist/index.js",
