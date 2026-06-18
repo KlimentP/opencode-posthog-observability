@@ -1,7 +1,11 @@
 import { PostHog } from "posthog-node";
 import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { buildGenerationProperties, buildToolSpanProperties, type SessionMetadata } from "./events.js";
+import {
+  buildGenerationProperties,
+  buildToolSpanProperties,
+  type SessionMetadata,
+} from "./events.js";
 import { loadConfig, mergePartialConfig, type PartialPluginConfig, type PluginConfig } from "./config.js";
 import { MessageTextCache } from "./text-cache.js";
 
@@ -52,6 +56,26 @@ type ToolStateLike = {
   time?: { start?: number; end?: number };
 };
 
+type ToolTranscriptEntry = {
+  sessionId: string;
+  messageId: string;
+  callId: string;
+  toolName: string;
+  status: string;
+  input?: unknown;
+  output?: unknown;
+  error?: unknown;
+  startedAt?: number;
+  finishedAt?: number;
+};
+
+type RequestMessage = {
+  role: string;
+  content: unknown;
+  tool_call_id?: string;
+  name?: string;
+};
+
 export const PostHogObservabilityPlugin: Plugin = async (
   input: PluginInput,
   options?: PartialPluginConfig,
@@ -65,7 +89,10 @@ export const PostHogObservabilityPlugin: Plugin = async (
   const messageSessions = new Map<string, string>();
   const messageRoles = new Map<string, string>();
   const messageInputs = new Map<string, string>();
+  const messageParents = new Map<string, string>();
   const partTypes = new Map<string, string>();
+  const toolTranscripts = new Map<string, ToolTranscriptEntry[]>();
+  const sessionToolTranscripts = new Map<string, ToolTranscriptEntry[]>();
   const capturedToolCalls = new Set<string>();
   let posthog: PostHog | undefined;
 
@@ -94,7 +121,10 @@ export const PostHogObservabilityPlugin: Plugin = async (
         if (extraBody !== undefined) {
           const existing = sessions.get(chatInput.sessionID);
           const input = extractInputFromRequestBody(extraBody);
-          if (existing && input) existing.input = input;
+          if (existing && input) {
+            existing.input = input;
+            log(`params input_roles=${inputRoles(input).join(">")}`);
+          }
         }
       }
     },
@@ -112,7 +142,10 @@ export const PostHogObservabilityPlugin: Plugin = async (
           messageSessions,
           messageRoles,
           messageInputs,
+          messageParents,
           partTypes,
+          toolTranscripts,
+          sessionToolTranscripts,
           capturedToolCalls,
           log,
         });
@@ -133,7 +166,10 @@ export const PostHogObservabilityPlugin: Plugin = async (
         messageSessions,
         messageRoles,
         messageInputs,
+        messageParents,
         partTypes,
+        toolTranscripts,
+        sessionToolTranscripts,
         capturedToolCalls,
         log,
       });
@@ -157,7 +193,10 @@ async function handleEvent(
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
     messageInputs: Map<string, string>;
+    messageParents: Map<string, string>;
     partTypes: Map<string, string>;
+    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
     capturedToolCalls: Set<string>;
     log: (message: string) => void;
   },
@@ -244,6 +283,9 @@ async function handleEvent(
       context.messageSessions.delete(messageId);
       context.messageRoles.delete(messageId);
       context.messageInputs.delete(messageId);
+      context.messageParents.delete(messageId);
+      context.toolTranscripts.delete(messageId);
+      removeSessionToolTranscripts(context.sessionToolTranscripts, messageId);
       removeMessagePartTypes(context.partTypes, messageId);
       removeCapturedToolCalls(context.capturedToolCalls, messageId);
     }
@@ -272,6 +314,7 @@ function rememberMessage(
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
     messageInputs: Map<string, string>;
+    messageParents: Map<string, string>;
   },
 ): void {
   const message = getMessage(properties);
@@ -282,6 +325,8 @@ function rememberMessage(
 
   context.messageSessions.set(message.id, sessionId);
   if (message.role) context.messageRoles.set(message.id, message.role);
+  const parentId = message.parentID ?? message.parentId;
+  if (parentId) context.messageParents.set(message.id, parentId);
 
   if (message.role === "user") {
     rememberInputFromTextCache(message.id, context);
@@ -307,7 +352,10 @@ function capturePendingMessages(
     messageSessions: Map<string, string>;
     messageRoles: Map<string, string>;
     messageInputs: Map<string, string>;
+    messageParents: Map<string, string>;
     partTypes: Map<string, string>;
+    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
     capturedToolCalls: Set<string>;
     log: (message: string) => void;
   },
@@ -326,6 +374,9 @@ function captureToolPart(
   context: {
     config: PluginConfig;
     posthog: PostHog;
+    messageParents: Map<string, string>;
+    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
     capturedToolCalls: Set<string>;
     log: (message: string) => void;
   },
@@ -341,6 +392,21 @@ function captureToolPart(
 
   const spanId = part.callID ?? part.callId ?? part.id;
   const captureKey = `${messageId}:${spanId}`;
+  const traceId = traceIdForMessageId(messageId, context);
+  const transcriptEntry = {
+    sessionId,
+    messageId,
+    callId: spanId,
+    toolName,
+    status: state.status,
+    input: state.input,
+    output: state.output,
+    error: state.error,
+    startedAt: state.time?.start,
+    finishedAt: state.time?.end,
+  };
+  rememberToolTranscript(context.toolTranscripts, transcriptEntry);
+  rememberToolTranscript(context.sessionToolTranscripts, transcriptEntry, sessionId);
   if (context.capturedToolCalls.has(captureKey)) return;
 
   context.posthog.capture({
@@ -350,6 +416,8 @@ function captureToolPart(
       sessionId,
       messageId,
       spanId,
+      traceId,
+      parentId: traceId,
       toolName,
       status: state.status,
       input: state.input,
@@ -366,6 +434,7 @@ function captureToolPart(
   });
   rememberCapturedMessage(context.capturedToolCalls, captureKey);
   context.log(`captured tool ${toolName} ${spanId} status=${state.status}`);
+  context.log(`tool trace=${traceId} parent=${traceId} span=${spanId}`);
 }
 
 function captureMessage(
@@ -378,6 +447,9 @@ function captureMessage(
     reasoningCache: MessageTextCache;
     capturedMessages: Set<string>;
     pendingMessages: Map<string, Record<string, unknown>>;
+    messageParents: Map<string, string>;
+    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
     messageInputs: Map<string, string>;
     log: (message: string) => void;
   },
@@ -394,17 +466,22 @@ function captureMessage(
 
   const output = context.textCache.get(message.id);
   const reasoning = context.reasoningCache.get(message.id);
+  const toolTranscript = toolTranscriptForSession(sessionId, context);
+  const traceId = traceIdForMessage(message, context);
   const usage = getUsage(message);
+  const input = context.messageInputs.get(message.id) ?? inputForAssistant(message, context) ?? context.sessions.get(sessionId)?.input;
   const session = {
     ...context.sessions.get(sessionId),
     model: context.sessions.get(sessionId)?.model ?? message.modelID,
     provider: context.sessions.get(sessionId)?.provider ?? message.providerID,
-    input: context.messageInputs.get(message.id) ?? inputForAssistant(message, context) ?? context.sessions.get(sessionId)?.input,
+    input: inputWithToolTranscript(input, toolTranscript),
     spanName: spanName(message),
   };
   const eventProperties = buildGenerationProperties({
     sessionId,
     messageId: message.id,
+    traceId,
+    parentId: traceId === message.id ? undefined : traceId,
     output,
     reasoning,
     usage,
@@ -422,8 +499,122 @@ function captureMessage(
   context.pendingMessages.delete(message.id);
   context.messageInputs.delete(message.id);
   context.log(
-    `captured message ${message.id} input=${textLength(session.input)} output=${output?.length ?? 0} reasoning=${reasoning?.length ?? 0}`,
+    `captured message ${message.id} input=${textLength(session.input)} output=${output?.length ?? 0} reasoning=${reasoning?.length ?? 0} tools=${toolTranscript.length}`,
   );
+  context.log(`message input_roles=${inputRoles(session.input).join(">")}`);
+  context.log(`message trace=${traceId} parent=${traceId === message.id ? "" : traceId} span=${message.id}`);
+}
+
+function rememberToolTranscript(
+  toolTranscripts: Map<string, ToolTranscriptEntry[]>,
+  entry: ToolTranscriptEntry,
+  key = entry.messageId,
+): void {
+  const existing = toolTranscripts.get(key) ?? [];
+  const index = existing.findIndex((item) => item.callId === entry.callId);
+  const next = index === -1 ? [...existing, entry] : existing.map((item, itemIndex) => itemIndex === index ? entry : item);
+  next.sort((left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0));
+  toolTranscripts.set(key, next);
+}
+
+function traceIdForMessage(
+  message: MessageLike,
+  context: {
+    messageParents: Map<string, string>;
+  },
+): string | undefined {
+  return message.id ? traceIdForMessageId(message.id, context) : undefined;
+}
+
+function traceIdForMessageId(
+  messageId: string,
+  context: {
+    messageParents: Map<string, string>;
+  },
+): string {
+  const visited = new Set<string>();
+  let current = messageId;
+
+  while (!visited.has(current)) {
+    visited.add(current);
+    const parentId = context.messageParents.get(current);
+    if (!parentId) return current;
+    current = parentId;
+  }
+
+  return messageId;
+}
+
+function toolTranscriptForMessage(
+  message: MessageLike,
+  context: {
+    messageParents: Map<string, string>;
+    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+  },
+): ToolTranscriptEntry[] {
+  if (!message.id) return [];
+  const result: ToolTranscriptEntry[] = [];
+  const visited = new Set<string>();
+  let current: string | undefined = message.id;
+
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    result.unshift(...(context.toolTranscripts.get(current) ?? []));
+    current = context.messageParents.get(current);
+  }
+
+  return result.sort((left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0));
+}
+
+function toolTranscriptForSession(
+  sessionId: string,
+  context: {
+    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
+  },
+): ToolTranscriptEntry[] {
+  return [...(context.sessionToolTranscripts.get(sessionId) ?? [])].sort(
+    (left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0),
+  );
+}
+
+function inputWithToolTranscript(input: unknown, toolTranscript: ToolTranscriptEntry[]): unknown {
+  if (toolTranscript.length === 0) return input;
+  if (Array.isArray(input) && input.some((item) => messageRole(item) === "tool")) return input;
+
+  const messages = Array.isArray(input)
+    ? [...input]
+    : input === undefined
+      ? []
+      : [{ role: "user", content: input }];
+
+  for (const tool of toolTranscript) {
+    messages.push({
+      role: "assistant",
+      content: [
+        {
+          type: "function",
+          function: {
+            name: tool.toolName,
+            arguments: tool.input,
+          },
+        },
+      ],
+    });
+    messages.push({
+      role: "tool",
+      tool_call_id: tool.callId,
+      name: tool.toolName,
+      content: contentToString(tool.status === "error" ? tool.error : tool.output),
+    });
+  }
+
+  return messages;
+}
+
+function messageRole(message: unknown): string | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const role = (message as Record<string, unknown>).role;
+  return typeof role === "string" ? role : undefined;
 }
 
 function spanName(message: MessageLike): string {
@@ -494,40 +685,77 @@ function getFirstString(record: Record<string, unknown>, ...keys: string[]): str
   return undefined;
 }
 
-function extractInputFromRequestBody(body: unknown): string | undefined {
+function extractInputFromRequestBody(body: unknown): RequestMessage[] | undefined {
   if (typeof body !== "object" || body === null) return undefined;
   const messages = (body as Record<string, unknown>).messages;
   if (!Array.isArray(messages)) return undefined;
 
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const item = messages[index];
-    if (typeof item !== "object" || item === null) continue;
-    const record = item as Record<string, unknown>;
-    if (record.role !== "user") continue;
-    return contentToString(record.content);
-  }
+  const normalized = messages
+    .map((item) => normalizeRequestMessage(item))
+    .filter((item): item is RequestMessage => Boolean(item));
 
-  return undefined;
+  return normalized.length > 0 ? normalized : undefined;
 }
 
-function contentToString(content: unknown): string | undefined {
+function normalizeRequestMessage(message: unknown): RequestMessage | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const record = message as Record<string, unknown>;
+  const role = typeof record.role === "string" ? record.role : undefined;
+  if (!role) return undefined;
+
+  const normalized: RequestMessage = {
+    role,
+    content: normalizeRequestContent(record.content),
+  };
+
+  const toolCallId = getFirstString(record, "tool_call_id", "toolCallId", "toolCallID");
+  if (toolCallId) normalized.tool_call_id = toolCallId;
+
+  const name = getFirstString(record, "name", "toolName", "tool_name");
+  if (name) normalized.name = name;
+
+  return normalized;
+}
+
+function normalizeRequestContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  const normalized = content.map((item) => normalizeRequestContentPart(item));
+  return normalized.length > 0 ? normalized : content;
+}
+
+function normalizeRequestContentPart(part: unknown): unknown {
+  if (typeof part !== "object" || part === null) return part;
+  const record = part as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : undefined;
+
+  if (type === "tool-call" || type === "tool_call") {
+    return {
+      type: "function",
+      function: {
+        name: getFirstString(record, "toolName", "tool_name", "name") ?? "tool",
+        arguments: record.input ?? record.args ?? record.arguments,
+      },
+    };
+  }
+
+  if (type === "tool-result" || type === "tool_result") {
+    return {
+      type: "text",
+      text: contentToString(record.output ?? record.result ?? record.content),
+    };
+  }
+
+  return part;
+}
+
+function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return undefined;
-
-  const text = content
-    .map((item) => {
-      if (typeof item === "string") return item;
-      if (typeof item === "object" && item !== null) {
-        const record = item as Record<string, unknown>;
-        if (typeof record.text === "string") return record.text;
-        if (typeof record.content === "string") return record.content;
-      }
-      return undefined;
-    })
-    .filter((item): item is string => Boolean(item))
-    .join("\n");
-
-  return text || undefined;
+  if (content === undefined) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
 }
 
 function rememberInputFromTextCache(
@@ -545,6 +773,7 @@ function rememberInputFromTextCache(
   const input = context.textCache.get(messageId);
   if (!input) return;
   const existing = context.sessions.get(sessionId) ?? {};
+  if (Array.isArray(existing.input)) return;
   context.sessions.set(sessionId, {
     ...existing,
     input,
@@ -607,6 +836,17 @@ function removeCapturedToolCalls(capturedToolCalls: Set<string>, messageId: stri
   }
 }
 
+function removeSessionToolTranscripts(sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>, messageId: string): void {
+  for (const [sessionId, entries] of sessionToolTranscripts) {
+    const next = entries.filter((entry) => entry.messageId !== messageId);
+    if (next.length === 0) {
+      sessionToolTranscripts.delete(sessionId);
+    } else if (next.length !== entries.length) {
+      sessionToolTranscripts.set(sessionId, next);
+    }
+  }
+}
+
 function textLength(value: unknown): number {
   if (typeof value === "string") return value.length;
   if (value === undefined) return 0;
@@ -615,6 +855,17 @@ function textLength(value: unknown): number {
   } catch {
     return 0;
   }
+}
+
+function inputRoles(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => {
+      if (typeof item !== "object" || item === null) return undefined;
+      const role = (item as Record<string, unknown>).role;
+      return typeof role === "string" ? role : undefined;
+    })
+    .filter((item): item is string => Boolean(item));
 }
 
 function formatError(error: unknown): string {

@@ -9,11 +9,19 @@ export type SessionMetadata = {
   spanName?: string;
 };
 
+export type GenerationOutputChoice = {
+  role: string;
+  content: unknown;
+};
+
 export type GenerationInput = {
   sessionId: string;
   messageId: string;
+  traceId?: string;
+  parentId?: string;
   output?: string;
   reasoning?: string;
+  outputChoices?: GenerationOutputChoice[];
   usage?: {
     input?: number;
     output?: number;
@@ -27,6 +35,8 @@ export type ToolSpanInput = {
   sessionId: string;
   messageId: string;
   spanId: string;
+  traceId?: string;
+  parentId?: string;
   toolName: string;
   status: string;
   input?: unknown;
@@ -43,9 +53,10 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
   const latency = typeof startedAt === "number" && finishedAt >= startedAt ? (finishedAt - startedAt) / 1000 : undefined;
 
   const properties: Record<string, unknown> = {
-    $ai_trace_id: input.messageId,
+    $ai_trace_id: input.traceId ?? input.messageId,
     $ai_session_id: input.sessionId,
     $ai_span_id: input.messageId,
+    $ai_parent_id: input.parentId,
     $ai_span_name: input.session?.spanName ?? "opencode generation",
     $ai_model: input.session?.model,
     $ai_provider: input.session?.provider,
@@ -64,12 +75,12 @@ export function buildGenerationProperties(input: GenerationInput, config: Plugin
   }
 
   if (config.captureOutputs) {
-    const outputChoices = [
+    const outputChoices = input.outputChoices ?? [
       ...(input.reasoning ? [{ content: input.reasoning, role: "reasoning" }] : []),
       ...(input.output ? [{ content: input.output, role: "assistant" }] : []),
     ];
     if (outputChoices.length > 0) {
-      properties.$ai_output_choices = outputChoices;
+      properties.$ai_output_choices = redact(outputChoices);
     }
   }
 
@@ -86,11 +97,11 @@ export function buildToolSpanProperties(input: ToolSpanInput, config: PluginConf
     : undefined;
 
   const properties: Record<string, unknown> = {
-    $ai_trace_id: input.messageId,
+    $ai_trace_id: input.traceId ?? input.messageId,
     $ai_session_id: input.sessionId,
     $ai_span_id: input.spanId,
     $ai_span_name: `tool: ${input.toolName}`,
-    $ai_parent_id: input.messageId,
+    $ai_parent_id: input.parentId ?? input.messageId,
     $ai_latency: latency,
     $ai_is_error: input.status === "error",
     $ai_error: input.error ? redact(input.error) : undefined,

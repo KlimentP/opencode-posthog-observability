@@ -66,12 +66,80 @@ test("normalizes string input to posthog input messages", () => {
   assert.deepEqual(properties.$ai_input, [{ role: "user", content: "Hello" }]);
 });
 
+test("builds generation properties with a shared trace parent", () => {
+  const properties = buildGenerationProperties(
+    {
+      sessionId: "session-1",
+      messageId: "assistant-message-1",
+      traceId: "user-message-1",
+      parentId: "user-message-1",
+      output: "Done",
+    },
+    config,
+  );
+
+  assert.equal(properties.$ai_trace_id, "user-message-1");
+  assert.equal(properties.$ai_span_id, "assistant-message-1");
+  assert.equal(properties.$ai_parent_id, "user-message-1");
+});
+
+test("uses structured output choices for generation transcripts", () => {
+  const properties = buildGenerationProperties(
+    {
+      sessionId: "session-1",
+      messageId: "message-1",
+      outputChoices: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: { command: "ls", apiKey: "secret" },
+              },
+            },
+            {
+              type: "text",
+              text: "Tool bash result: src",
+            },
+          ],
+        },
+        { role: "assistant", content: "Done" },
+      ],
+    },
+    config,
+  );
+
+  assert.deepEqual(properties.$ai_output_choices, [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "function",
+          function: {
+            name: "bash",
+            arguments: { command: "ls", apiKey: "[Redacted]" },
+          },
+        },
+        {
+          type: "text",
+          text: "Tool bash result: src",
+        },
+      ],
+    },
+    { role: "assistant", content: "Done" },
+  ]);
+});
+
 test("builds posthog ai span properties for tool calls", () => {
   const properties = buildToolSpanProperties(
     {
       sessionId: "session-1",
       messageId: "message-1",
       spanId: "tool-call-1",
+      traceId: "user-message-1",
+      parentId: "user-message-1",
       toolName: "bash",
       status: "completed",
       input: { command: "ls" },
@@ -83,10 +151,10 @@ test("builds posthog ai span properties for tool calls", () => {
     config,
   );
 
-  assert.equal(properties.$ai_trace_id, "message-1");
+  assert.equal(properties.$ai_trace_id, "user-message-1");
   assert.equal(properties.$ai_session_id, "session-1");
   assert.equal(properties.$ai_span_id, "tool-call-1");
-  assert.equal(properties.$ai_parent_id, "message-1");
+  assert.equal(properties.$ai_parent_id, "user-message-1");
   assert.equal(properties.$ai_span_name, "tool: bash");
   assert.equal(properties.$ai_latency, 0.75);
   assert.equal(properties.$ai_is_error, false);
