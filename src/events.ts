@@ -104,7 +104,7 @@ export function buildToolSpanProperties(input: ToolSpanInput, config: PluginConf
     $ai_parent_id: input.parentId ?? input.messageId,
     $ai_latency: latency,
     $ai_is_error: input.status === "error",
-    $ai_error: input.error ? redact(input.error) : undefined,
+    $ai_error: input.error ? truncatePayload(redact(input.error), config.maxTextLength) : undefined,
     opencode_session_id: input.sessionId,
     opencode_message_id: input.messageId,
     opencode_tool_call_id: input.spanId,
@@ -115,12 +115,14 @@ export function buildToolSpanProperties(input: ToolSpanInput, config: PluginConf
     ...prefixTags(config.tags),
   };
 
+  const maxTextLength = config.maxTextLength;
+
   if (config.captureInputs && input.input !== undefined) {
-    properties.$ai_input_state = redact(input.input);
+    properties.$ai_input_state = truncatePayload(redact(input.input), maxTextLength);
   }
 
   if (config.captureOutputs && input.output !== undefined) {
-    properties.$ai_output_state = redact(input.output);
+    properties.$ai_output_state = truncatePayload(redact(input.output), maxTextLength);
   }
 
   if (config.captureMetadata && input.metadata) {
@@ -161,4 +163,12 @@ function prefixTags(tags: Record<string, string>): Record<string, string> {
 
 function dropUndefined(value: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+function truncatePayload(value: unknown, maxTextLength: number): unknown {
+  if (maxTextLength <= 0) return "";
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== "string") return value;
+  if (serialized.length <= maxTextLength) return value;
+  return `${serialized.slice(0, maxTextLength)}...[truncated]`;
 }

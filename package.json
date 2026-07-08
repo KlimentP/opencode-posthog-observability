@@ -30,8 +30,19 @@
     "ai-observability",
     "telemetry"
   ],
-  "author": "",
+  "author": "Kliment Preshlenov <kliment.preshlenov@gmail.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KlimentP/opencode-posthog-observability.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KlimentP/opencode-posthog-observability/issues"
+  },
+  "homepage": "https://github.com/KlimentP/opencode-posthog-observability#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "posthog-node": "^5.38.0",
     "strip-json-comments": "^5.0.3"

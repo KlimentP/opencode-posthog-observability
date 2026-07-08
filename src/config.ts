@@ -110,10 +110,6 @@ export function mergeConfig(base: PluginConfig, override?: PartialPluginConfig):
   };
 }
 
-export function mergePartialConfig(base: PluginConfig, override?: PartialPluginConfig): PluginConfig {
-  return mergeConfig(base, override);
-}
-
 function loadConfigFile(env: NodeJS.ProcessEnv, cwd: string): PartialPluginConfig | undefined {
   for (const path of configPaths(env, cwd)) {
     if (!existsSync(path)) continue;

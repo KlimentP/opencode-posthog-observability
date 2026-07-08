@@ -6,7 +6,7 @@ import {
   buildToolSpanProperties,
   type SessionMetadata,
 } from "./events.js";
-import { loadConfig, mergePartialConfig, type PartialPluginConfig, type PluginConfig } from "./config.js";
+import { loadConfig, mergeConfig, type PartialPluginConfig, type PluginConfig } from "./config.js";
 import { MessageTextCache } from "./text-cache.js";
 
 export type { PartialPluginConfig, PluginConfig } from "./config.js";
@@ -76,16 +76,40 @@ type RequestMessage = {
   name?: string;
 };
 
+type PluginContext = {
+  config: PluginConfig;
+  posthog: PostHog;
+  sessions: Map<string, SessionMetadata>;
+  textCache: MessageTextCache;
+  reasoningCache: MessageTextCache;
+  capturedMessages: Set<string>;
+  pendingMessages: Map<string, Record<string, unknown>>;
+  pendingAttempts: Map<string, number>;
+  messageSessions: Map<string, string>;
+  messageRoles: Map<string, string>;
+  messageInputs: Map<string, string>;
+  messageParents: Map<string, string>;
+  partTypes: Map<string, string>;
+  toolTranscripts: Map<string, ToolTranscriptEntry[]>;
+  sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
+  capturedToolCalls: Set<string>;
+  log: (message: string) => void;
+};
+
+const MAX_PENDING_ATTEMPTS = 5;
+const MAX_MESSAGE_PARENTS = 2_048;
+
 export const PostHogObservabilityPlugin: Plugin = async (
   input: PluginInput,
   options?: PartialPluginConfig,
 ): Promise<Hooks> => {
-  const config = mergePartialConfig(loadConfig(undefined, input.directory), options);
+  const config = mergeConfig(loadConfig(undefined, input.directory), options);
   const sessions = new Map<string, SessionMetadata>();
   const textCache = new MessageTextCache({ maxTextLength: config.maxTextLength });
   const reasoningCache = new MessageTextCache({ maxTextLength: config.maxTextLength });
   const capturedMessages = new Set<string>();
   const pendingMessages = new Map<string, Record<string, unknown>>();
+  const pendingAttempts = new Map<string, number>();
   const messageSessions = new Map<string, string>();
   const messageRoles = new Map<string, string>();
   const messageInputs = new Map<string, string>();
@@ -94,8 +118,6 @@ export const PostHogObservabilityPlugin: Plugin = async (
   const toolTranscripts = new Map<string, ToolTranscriptEntry[]>();
   const sessionToolTranscripts = new Map<string, ToolTranscriptEntry[]>();
   const capturedToolCalls = new Set<string>();
-  let posthog: PostHog | undefined;
-
   const log = logger(input, config);
 
   if (!config.projectToken) {
@@ -103,8 +125,28 @@ export const PostHogObservabilityPlugin: Plugin = async (
     return {};
   }
 
-  posthog = new PostHog(config.projectToken, { host: config.host });
+  const posthog = new PostHog(config.projectToken, { host: config.host });
   log(`enabled: ${config.host}`);
+
+  const context: PluginContext = {
+    config,
+    posthog,
+    sessions,
+    textCache,
+    reasoningCache,
+    capturedMessages,
+    pendingMessages,
+    pendingAttempts,
+    messageSessions,
+    messageRoles,
+    messageInputs,
+    messageParents,
+    partTypes,
+    toolTranscripts,
+    sessionToolTranscripts,
+    capturedToolCalls,
+    log,
+  };
 
   return {
     async "chat.params"(chatInput, output) {
@@ -131,76 +173,22 @@ export const PostHogObservabilityPlugin: Plugin = async (
 
     async event({ event }) {
       try {
-        await handleEvent(event, {
-          config,
-          posthog: posthog!,
-          sessions,
-          textCache,
-          reasoningCache,
-          capturedMessages,
-          pendingMessages,
-          messageSessions,
-          messageRoles,
-          messageInputs,
-          messageParents,
-          partTypes,
-          toolTranscripts,
-          sessionToolTranscripts,
-          capturedToolCalls,
-          log,
-        });
+        await handleEvent(event, context);
       } catch (error) {
         log(`hook error: ${formatError(error)}`);
       }
     },
 
     async dispose() {
-      capturePendingMessages({
-        config,
-        posthog: posthog!,
-        sessions,
-        textCache,
-        reasoningCache,
-        capturedMessages,
-        pendingMessages,
-        messageSessions,
-        messageRoles,
-        messageInputs,
-        messageParents,
-        partTypes,
-        toolTranscripts,
-        sessionToolTranscripts,
-        capturedToolCalls,
-        log,
-      });
-      await posthog?._shutdown(config.flushTimeoutMs);
+      capturePendingMessages(context);
+      await posthog._shutdown(config.flushTimeoutMs);
     },
   };
 };
 
 export default PostHogObservabilityPlugin;
 
-async function handleEvent(
-  envelope: Event,
-  context: {
-    config: PluginConfig;
-    posthog: PostHog;
-    sessions: Map<string, SessionMetadata>;
-    textCache: MessageTextCache;
-    reasoningCache: MessageTextCache;
-    capturedMessages: Set<string>;
-    pendingMessages: Map<string, Record<string, unknown>>;
-    messageSessions: Map<string, string>;
-    messageRoles: Map<string, string>;
-    messageInputs: Map<string, string>;
-    messageParents: Map<string, string>;
-    partTypes: Map<string, string>;
-    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    capturedToolCalls: Set<string>;
-    log: (message: string) => void;
-  },
-): Promise<void> {
+async function handleEvent(envelope: Event, context: PluginContext): Promise<void> {
   const type = String(envelope.type);
   const properties = (envelope as { properties?: unknown }).properties as Record<string, unknown> | undefined;
   if (!properties) return;
@@ -275,20 +263,7 @@ async function handleEvent(
 
   if (type === "message.removed") {
     const messageId = getMessage(properties)?.id ?? getString(properties, "messageID", "messageId");
-    if (messageId) {
-      context.textCache.removeMessage(messageId);
-      context.reasoningCache.removeMessage(messageId);
-      context.capturedMessages.delete(messageId);
-      context.pendingMessages.delete(messageId);
-      context.messageSessions.delete(messageId);
-      context.messageRoles.delete(messageId);
-      context.messageInputs.delete(messageId);
-      context.messageParents.delete(messageId);
-      context.toolTranscripts.delete(messageId);
-      removeSessionToolTranscripts(context.sessionToolTranscripts, messageId);
-      removeMessagePartTypes(context.partTypes, messageId);
-      removeCapturedToolCalls(context.capturedToolCalls, messageId);
-    }
+    if (messageId) removeMessageState(context, messageId);
     return;
   }
 
@@ -300,23 +275,12 @@ async function handleEvent(
   if (type === "session.deleted" || type === "session.idle" || type === "session.error") {
     const sessionId = getSession(properties)?.id ?? getString(properties, "sessionID", "sessionId");
     capturePendingMessages(context, sessionId);
-    if (sessionId && type === "session.deleted") context.sessions.delete(sessionId);
+    if (sessionId && type === "session.deleted") removeSessionState(context, sessionId);
     await context.posthog.flush();
   }
 }
 
-function rememberMessage(
-  properties: Record<string, unknown>,
-  context: {
-    sessions: Map<string, SessionMetadata>;
-    textCache: MessageTextCache;
-    pendingMessages: Map<string, Record<string, unknown>>;
-    messageSessions: Map<string, string>;
-    messageRoles: Map<string, string>;
-    messageInputs: Map<string, string>;
-    messageParents: Map<string, string>;
-  },
-): void {
+function rememberMessage(properties: Record<string, unknown>, context: PluginContext): void {
   const message = getMessage(properties);
   if (!message?.id) return;
 
@@ -326,7 +290,7 @@ function rememberMessage(
   context.messageSessions.set(message.id, sessionId);
   if (message.role) context.messageRoles.set(message.id, message.role);
   const parentId = message.parentID ?? message.parentId;
-  if (parentId) context.messageParents.set(message.id, parentId);
+  if (parentId) rememberMessageParent(context, message.id, parentId);
 
   if (message.role === "user") {
     rememberInputFromTextCache(message.id, context);
@@ -338,48 +302,31 @@ function rememberMessage(
   const input = inputForAssistant(message, context);
   if (input) context.messageInputs.set(message.id, input);
   context.pendingMessages.set(message.id, properties);
+  context.pendingAttempts.delete(message.id);
 }
 
-function capturePendingMessages(
-  context: {
-    config: PluginConfig;
-    posthog: PostHog;
-    sessions: Map<string, SessionMetadata>;
-    textCache: MessageTextCache;
-    reasoningCache: MessageTextCache;
-    capturedMessages: Set<string>;
-    pendingMessages: Map<string, Record<string, unknown>>;
-    messageSessions: Map<string, string>;
-    messageRoles: Map<string, string>;
-    messageInputs: Map<string, string>;
-    messageParents: Map<string, string>;
-    partTypes: Map<string, string>;
-    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    capturedToolCalls: Set<string>;
-    log: (message: string) => void;
-  },
-  sessionId?: string,
-): void {
+function capturePendingMessages(context: PluginContext, sessionId?: string): void {
   for (const [messageId, properties] of context.pendingMessages) {
     const messageSessionId = context.messageSessions.get(messageId);
     if (sessionId && messageSessionId !== sessionId) continue;
-    captureMessage(properties, context);
+    const captured = captureMessage(properties, context);
+    if (captured) {
+      context.pendingAttempts.delete(messageId);
+      continue;
+    }
+    const attempts = (context.pendingAttempts.get(messageId) ?? 0) + 1;
+    context.pendingAttempts.set(messageId, attempts);
+    if (attempts >= MAX_PENDING_ATTEMPTS) {
+      removeMessageState(context, messageId);
+      context.log(`dropped pending message ${messageId} after ${attempts} failed capture attempts`);
+    }
   }
 }
 
 function captureToolPart(
   part: PartLike,
   properties: Record<string, unknown>,
-  context: {
-    config: PluginConfig;
-    posthog: PostHog;
-    messageParents: Map<string, string>;
-    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    capturedToolCalls: Set<string>;
-    log: (message: string) => void;
-  },
+  context: PluginContext,
 ): void {
   const state = part.state;
   if (!part.id || !state?.status) return;
@@ -437,32 +384,16 @@ function captureToolPart(
   context.log(`tool trace=${traceId} parent=${traceId} span=${spanId}`);
 }
 
-function captureMessage(
-  properties: Record<string, unknown>,
-  context: {
-    config: PluginConfig;
-    posthog: PostHog;
-    sessions: Map<string, SessionMetadata>;
-    textCache: MessageTextCache;
-    reasoningCache: MessageTextCache;
-    capturedMessages: Set<string>;
-    pendingMessages: Map<string, Record<string, unknown>>;
-    messageParents: Map<string, string>;
-    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
-    messageInputs: Map<string, string>;
-    log: (message: string) => void;
-  },
-): void {
+function captureMessage(properties: Record<string, unknown>, context: PluginContext): boolean {
   const message = getMessage(properties);
-  if (!message?.id) return;
-  if (message.role && message.role !== "assistant") return;
-  if (!isMessageComplete(message)) return;
-  if (!context.textCache.get(message.id)) return;
-  if (context.capturedMessages.has(message.id)) return;
+  if (!message?.id) return false;
+  if (message.role && message.role !== "assistant") return false;
+  if (!isMessageComplete(message)) return false;
+  if (!context.textCache.get(message.id)) return false;
+  if (context.capturedMessages.has(message.id)) return false;
 
   const sessionId = message.sessionID ?? message.sessionId ?? getString(properties, "sessionID", "sessionId");
-  if (!sessionId) return;
+  if (!sessionId) return false;
 
   const output = context.textCache.get(message.id);
   const reasoning = context.reasoningCache.get(message.id);
@@ -497,12 +428,50 @@ function captureMessage(
   });
   rememberCapturedMessage(context.capturedMessages, message.id);
   context.pendingMessages.delete(message.id);
-  context.messageInputs.delete(message.id);
+  context.pendingAttempts.delete(message.id);
   context.log(
     `captured message ${message.id} input=${textLength(session.input)} output=${output?.length ?? 0} reasoning=${reasoning?.length ?? 0} tools=${toolTranscript.length}`,
   );
   context.log(`message input_roles=${inputRoles(session.input).join(">")}`);
   context.log(`message trace=${traceId} parent=${traceId === message.id ? "" : traceId} span=${message.id}`);
+
+  cleanupMessageAfterCapture(context, message.id, sessionId);
+  return true;
+}
+
+function cleanupMessageAfterCapture(context: PluginContext, messageId: string, sessionId: string): void {
+  context.textCache.removeMessage(messageId);
+  context.reasoningCache.removeMessage(messageId);
+  context.messageSessions.delete(messageId);
+  context.messageRoles.delete(messageId);
+  context.messageInputs.delete(messageId);
+  context.toolTranscripts.delete(messageId);
+  removeMessagePartTypes(context.partTypes, messageId);
+  context.sessionToolTranscripts.delete(sessionId);
+}
+
+function removeMessageState(context: PluginContext, messageId: string): void {
+  context.textCache.removeMessage(messageId);
+  context.reasoningCache.removeMessage(messageId);
+  context.capturedMessages.delete(messageId);
+  context.pendingMessages.delete(messageId);
+  context.pendingAttempts.delete(messageId);
+  context.messageSessions.delete(messageId);
+  context.messageRoles.delete(messageId);
+  context.messageInputs.delete(messageId);
+  context.messageParents.delete(messageId);
+  context.toolTranscripts.delete(messageId);
+  removeMessagePartTypes(context.partTypes, messageId);
+  removeSessionToolTranscripts(context.sessionToolTranscripts, messageId);
+  removeCapturedToolCalls(context.capturedToolCalls, messageId);
+}
+
+function removeSessionState(context: PluginContext, sessionId: string): void {
+  context.sessions.delete(sessionId);
+  context.sessionToolTranscripts.delete(sessionId);
+  for (const [messageId, messageSessionId] of context.messageSessions) {
+    if (messageSessionId === sessionId) removeMessageState(context, messageId);
+  }
 }
 
 function rememberToolTranscript(
@@ -517,21 +486,11 @@ function rememberToolTranscript(
   toolTranscripts.set(key, next);
 }
 
-function traceIdForMessage(
-  message: MessageLike,
-  context: {
-    messageParents: Map<string, string>;
-  },
-): string | undefined {
+function traceIdForMessage(message: MessageLike, context: PluginContext): string | undefined {
   return message.id ? traceIdForMessageId(message.id, context) : undefined;
 }
 
-function traceIdForMessageId(
-  messageId: string,
-  context: {
-    messageParents: Map<string, string>;
-  },
-): string {
+function traceIdForMessageId(messageId: string, context: PluginContext): string {
   const visited = new Set<string>();
   let current = messageId;
 
@@ -545,32 +504,9 @@ function traceIdForMessageId(
   return messageId;
 }
 
-function toolTranscriptForMessage(
-  message: MessageLike,
-  context: {
-    messageParents: Map<string, string>;
-    toolTranscripts: Map<string, ToolTranscriptEntry[]>;
-  },
-): ToolTranscriptEntry[] {
-  if (!message.id) return [];
-  const result: ToolTranscriptEntry[] = [];
-  const visited = new Set<string>();
-  let current: string | undefined = message.id;
-
-  while (current && !visited.has(current)) {
-    visited.add(current);
-    result.unshift(...(context.toolTranscripts.get(current) ?? []));
-    current = context.messageParents.get(current);
-  }
-
-  return result.sort((left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0));
-}
-
 function toolTranscriptForSession(
   sessionId: string,
-  context: {
-    sessionToolTranscripts: Map<string, ToolTranscriptEntry[]>;
-  },
+  context: PluginContext,
 ): ToolTranscriptEntry[] {
   return [...(context.sessionToolTranscripts.get(sessionId) ?? [])].sort(
     (left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0),
@@ -622,12 +558,7 @@ function spanName(message: MessageLike): string {
   return label ? `opencode generation (${label})` : "opencode generation";
 }
 
-function inputForAssistant(
-  message: MessageLike,
-  context: {
-    textCache: MessageTextCache;
-  },
-): string | undefined {
+function inputForAssistant(message: MessageLike, context: PluginContext): string | undefined {
   const parentId = message.parentID ?? message.parentId;
   if (!parentId) return undefined;
   return context.textCache.get(parentId);
@@ -758,15 +689,7 @@ function contentToString(content: unknown): string {
   }
 }
 
-function rememberInputFromTextCache(
-  messageId: string,
-  context: {
-    sessions: Map<string, SessionMetadata>;
-    textCache: MessageTextCache;
-    messageSessions: Map<string, string>;
-    messageRoles: Map<string, string>;
-  },
-): void {
+function rememberInputFromTextCache(messageId: string, context: PluginContext): void {
   if (context.messageRoles.get(messageId) !== "user") return;
   const sessionId = context.messageSessions.get(messageId);
   if (!sessionId) return;
@@ -778,6 +701,15 @@ function rememberInputFromTextCache(
     ...existing,
     input,
   });
+}
+
+function rememberMessageParent(context: PluginContext, messageId: string, parentId: string): void {
+  context.messageParents.set(messageId, parentId);
+  while (context.messageParents.size > MAX_MESSAGE_PARENTS) {
+    const oldest = context.messageParents.keys().next().value as string | undefined;
+    if (!oldest) return;
+    context.messageParents.delete(oldest);
+  }
 }
 
 function getString(properties: Record<string, unknown>, ...keys: string[]): string | undefined {

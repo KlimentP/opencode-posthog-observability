@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig } from "../dist/config.js";
+import { loadConfig, mergeConfig } from "../dist/config.js";
 
 test("loads config from project .opencode jsonc and applies env overrides", () => {
   const dir = join(tmpdir(), `opencode-posthog-${Date.now()}`);
@@ -35,4 +35,45 @@ test("loads config from project .opencode jsonc and applies env overrides", () =
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("mergeConfig merges tags from base and override", () => {
+  const base = {
+    projectToken: "base",
+    host: "https://us.i.posthog.com",
+    distinctId: "opencode",
+    captureInputs: true,
+    captureOutputs: true,
+    captureMetadata: true,
+    maxTextLength: 100,
+    diagnostics: false,
+    flushTimeoutMs: 1000,
+    tags: { env: "prod", team: "ai" },
+  };
+
+  const merged = mergeConfig(base, { tags: { team: "ops", region: "eu" } });
+
+  assert.deepEqual(merged.tags, { env: "prod", team: "ops", region: "eu" });
+  assert.equal(merged.projectToken, "base");
+  assert.notEqual(merged.tags, base.tags);
+});
+
+test("mergeConfig returns base tags copy when no override", () => {
+  const base = {
+    projectToken: "base",
+    host: "https://us.i.posthog.com",
+    distinctId: "opencode",
+    captureInputs: true,
+    captureOutputs: true,
+    captureMetadata: true,
+    maxTextLength: 100,
+    diagnostics: false,
+    flushTimeoutMs: 1000,
+    tags: { env: "prod" },
+  };
+
+  const merged = mergeConfig(base);
+
+  assert.deepEqual(merged.tags, { env: "prod" });
+  assert.notEqual(merged.tags, base.tags);
 });
